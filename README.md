@@ -3,8 +3,8 @@
 > Heatwaves, floods, droughts and every leaking pipe in between, on one map, in your language, for **any city in the world**.
 
 Built for the **Amazon AWS Environmental Hackathon**. Pick a city (or search any town, or use your location) and FloodSense AI shows where the climate risk is highest right now, tells residents what to do in plain language, warns them by email or SMS before it gets worse, and turns citizen reports of water leaks into a repair-priority list.
-
-**Live demo:** `<add your CloudFront or Render URL here>` | **Demo video:** `<add link>` | **Team:** `<add names>`
+<img width="1917" height="908" alt="image" src="https://github.com/user-attachments/assets/89ff32ec-5c43-49c0-bf99-5ca2f1153c5b" />
+<img width="1917" height="912" alt="image" src="https://github.com/user-attachments/assets/4bad3f93-581a-4075-b43e-9d880ecd6c07" />
 
 ---
 
