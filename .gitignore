@@ -1,0 +1,6 @@
+node_modules
+dist
+.aws-sam
+.venv
+__pycache__
+.env

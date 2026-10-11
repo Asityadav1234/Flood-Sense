@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: FloodSense AI - flood, heatwave, drought and water-leak intelligence for any city (Lambda container + DynamoDB + Bedrock Guardrails + SNS + EventBridge + Rekognition + S3/CloudFront + Bedrock)
+
+Parameters:
+  EnableGuardrail:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  BedrockModelId:
+    Type: String
+    Default: amazon.nova-lite-v1:0
+
+Conditions:
+  UseGuardrail: !Equals [!Ref EnableGuardrail, "true"]
+
+Resources:
+  # Shared cache (weather, drought, OpenStreetMap answers) and rate-limit counters. Entries expire by themselves (ttl).
+  CacheTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: k
+          AttributeType: S
+      KeySchema:
+        - AttributeName: k
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Optional Amazon Bedrock Guardrail for the open-ended "Ask FloodSense" box (set EnableGuardrail=false to skip it)
+  Guardrail:
+    Type: AWS::Bedrock::Guardrail
+    Condition: UseGuardrail
+    Properties:
+      Name: !Sub "${AWS::StackName}-ask"
+      Description: Keeps Ask FloodSense on topic and safe
+      BlockedInputMessaging: "Sorry, I can only help with flood, heat, drought and water questions."
+      BlockedOutputsMessaging: "Sorry, I cannot provide that answer."
+      ContentPolicyConfig:
+        FiltersConfig:
+          - { Type: HATE, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: VIOLENCE, InputStrength: MEDIUM, OutputStrength: MEDIUM }
+          - { Type: INSULTS, InputStrength: MEDIUM, OutputStrength: MEDIUM }
+          - { Type: MISCONDUCT, InputStrength: MEDIUM, OutputStrength: MEDIUM }
+          - { Type: PROMPT_ATTACK, InputStrength: HIGH, OutputStrength: NONE }
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - { Type: EMAIL, Action: ANONYMIZE }
+          - { Type: PHONE, Action: ANONYMIZE }
+
+  LeaksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: cell
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:       # map-area queries read one ~5 km grid cell at a time instead of scanning the table
+        - IndexName: CellIndex
+          KeySchema:
+            - AttributeName: cell
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Areas people asked to be alerted about; the scheduled monitor checks these (ttl = auto-forget after 90 days)
+  WatchTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: area
+          AttributeType: S
+      KeySchema:
+        - AttributeName: area
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # Email alerts. Subscribers only receive their own area/level via SNS filter policies on message attributes.
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: FloodSense early warnings
+
+  # Private bucket for leak photos. Browsers upload with a short-lived presigned POST; photos expire after 30 days.
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-leak-photos
+            Status: Enabled
+            ExpirationInDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST, GET]
+            AllowedOrigins: [!Sub "https://${SiteDistribution.DomainName}", "http://localhost:5173"]
+            AllowedHeaders: ["*"]
+            MaxAge: 3000
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      Architectures: [x86_64]
+      MemorySize: 2048
+      Timeout: 120
+      Environment:
+        Variables:
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          USE_BEDROCK: "1"
+          LEAKS_TABLE: !Ref LeaksTable
+          WATCH_TABLE: !Ref WatchTable
+          ALERTS_TOPIC_ARN: !Ref AlertsTopic
+          PHOTO_BUCKET: !Ref PhotoBucket
+          CACHE_TABLE: !Ref CacheTable
+          ALLOWED_ORIGIN: !Sub "https://${SiteDistribution.DomainName}"
+          GUARDRAIL_ID: !If [UseGuardrail, !GetAtt Guardrail.GuardrailId, ""]
+      FunctionUrlConfig:
+        AuthType: NONE          # public demo URL; CORS is handled by FastAPI
+      Events:
+        EarlyWarning:            # proactive monitor: re-checks every watched area and alerts when risk rises
+          Type: Schedule
+          Properties:
+            Schedule: rate(3 hours)
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LeaksTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WatchTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CacheTable
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:Query]
+              Resource: !Sub "${LeaksTable.Arn}/index/CellIndex"
+            - Effect: Allow
+              Action: [bedrock:ApplyGuardrail]
+              Resource: !If [UseGuardrail, !GetAtt Guardrail.GuardrailArn, "*"]
+        - Statement:
+            - Effect: Allow
+              Action: [s3:PutObject, s3:GetObject, s3:DeleteObject]
+              Resource: !Sub "${PhotoBucket.Arn}/*"
+            - Effect: Allow
+              Action: [rekognition:DetectLabels, rekognition:DetectModerationLabels]
+              Resource: "*"
+        - Statement:
+            - Effect: Allow
+              Action: [sns:Publish, sns:Subscribe]
+              Resource: !Ref AlertsTopic
+        - Statement:
+            - Effect: Allow
+              Action: [bedrock:InvokeModel]
+              Resource: "*"
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./backend
+      DockerTag: v1
+
+  # Accounts created after Oct 2025 need BOTH lambda:InvokeFunctionUrl (added by SAM) and lambda:InvokeFunction
+  # for a public Function URL; without this the URL returns 403 Forbidden.
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: "*"
+      InvokedViaFunctionUrl: true
+
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6   # Managed-CachingOptimized
+          ResponseHeadersPolicyId: 67f7725c-6f97-4210-82d7-5512b31e9d03   # Managed-SecurityHeadersPolicy
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}"
+
+Outputs:
+  ApiUrl:
+    Value: !GetAtt ApiFunctionUrl.FunctionUrl
+  BucketName:
+    Value: !Ref SiteBucket
+  DistributionId:
+    Value: !Ref SiteDistribution
+  LeaksTableName:
+    Value: !Ref LeaksTable
+  PhotoBucketName:
+    Value: !Ref PhotoBucket
+  AlertsTopicArn:
+    Value: !Ref AlertsTopic
+  SiteUrl:
+    Value: !Sub "https://${SiteDistribution.DomainName}"
